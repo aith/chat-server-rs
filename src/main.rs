@@ -27,7 +27,7 @@
 #![warn(rust_2018_idioms)]
 
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, oneshot};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio_stream::StreamExt;
 use tokio_util::codec::{Framed, LinesCodec};
@@ -40,6 +40,7 @@ use std::error::Error;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use futures::executor::block_on;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -55,7 +56,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     tracing::info!("server running on {}", addr);
 
     // Graceful shutdown if called
-    cancel_tasks().await?;
+    tokio::spawn(async move {
+        return cancel_tasks().await;
+    });
 
     loop {
         // Asynchronously wait for an inbound TcpStream.
@@ -166,10 +169,15 @@ impl Peer {
 
 async fn cancel_tasks() -> Result<(), Box<dyn std::error::Error>>
 {
-    println!("waiting for ctrl-c");
-    tokio::signal::ctrl_c().await.expect("failed to listen for event");
-   println!("received ctrl-c event");
-    Ok(())
+    let mut term = signal(SignalKind::terminate())?;
+    tokio::select! {
+        option = tokio::signal::ctrl_c() => {
+            Ok(())
+        },
+        option = term.recv() => {
+            Ok(())
+        }
+    }
 }
 
 /// Process an individual chat client
@@ -205,18 +213,7 @@ async fn process(
         }
         _ => {
             // TODO this isn't sent in time
-            // let (send, mut recv) = mpsc::channel::<String>(1);
-            // {
-            //     tokio::spawn(async move {
-            //         let _test = sx.send("Error".to_string());
-            //     });
-            //
-            // }
-            // drop(send);
-            // let _ = recv.recv();
-
-            println!("Wrong input");
-            tracing::error!("Incorrect input");
+            peer.lines.send("Error").await?;  // into() turns err into return type
             return Ok(());
         }
     };
@@ -245,7 +242,6 @@ async fn process(
                 Some(Ok(msg)) => {
                     let mut state = state.lock().await;
                     let msg = format!("{}: {}", username, msg);
-
                     state.broadcast(addr, &msg, roomid.to_string()).await;
                 }
                 // An error occurred.
