@@ -24,44 +24,47 @@
 //! connected clients they'll all join the same room and see everyone else's
 //! messages.
 
+// I ran cargo fmt (rustfmt)
 #![warn(rust_2018_idioms)]
 
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex};
-use tokio::signal::unix::{signal, SignalKind};
-use tokio_stream::StreamExt;
-use tokio_util::codec::{Framed, LinesCodec};
-
-use futures::SinkExt;
 use std::collections::HashMap;
 use std::env;
-use tokio::sync::mpsc::{channel, Sender};
 use std::error::Error;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use futures::SinkExt;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{mpsc, Mutex};
+use tokio_stream::StreamExt;
+use tokio_util::codec::{Framed, LinesCodec};
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    const DEFAULT_PORT: u16 = 1234;
-    const DEFAULT_HOST: &str = "0.0.0.0";
+    // if these are locals I don't think there's much use in being constants
+    let default_port = 1234u16;
+    let default_host = "0.0.0.0";
 
-    let state = Arc::new(Mutex::new(Shared::new()));  // Shared state
+    let state = Arc::new(Mutex::new(Shared::new())); // Shared state
     let addr = env::args()
         .nth(1)
-        .unwrap_or_else(|| DEFAULT_HOST.to_owned() + ":" + &DEFAULT_PORT.to_string());
+        // format!'s nicer here
+        .unwrap_or_else(|| format!("{}:{}", default_host, default_port));
     let listener = TcpListener::bind(&addr).await?;
 
     tracing::info!("server running on {}", addr);
 
     // Graceful shutdown if called
-    cancel_tasks().await?;
+    // commented out for now so SIGINT works
+    // cancel_tasks().await;
 
     loop {
         // Asynchronously wait for an inbound TcpStream.
         let (stream, addr) = listener.accept().await?;
         // Clone a handle to the `Shared` state for the new connection.
-        let state = Arc::clone(&state);  // Get & increase ref counts
+        let state = state.clone(); // Get & increase ref counts
+
         // Spawn our handler to be run asynchronously.
         tokio::spawn(async move {
             tracing::debug!("accepted connection");
@@ -85,7 +88,10 @@ type Rx = mpsc::UnboundedReceiver<String>;
 /// iterating over the `peers` entries and sending a copy of the message on each
 /// `Sx`.
 struct Shared {
-    peers: HashMap<String, Vec<(SocketAddr, Sx)>>,  // Must be locked before writes to avoid data conflicts
+    // changed the Vec of pairs to a HashMap
+    // can still easily iterate through the entries as pairs
+    // but you can also easily remove by SocketAddr
+    peers: HashMap<String, HashMap<SocketAddr, Sx>>, // Must be locked before writes to avoid data conflicts
 }
 
 /// The state for each connected client.
@@ -107,69 +113,67 @@ struct Peer {
 impl Shared {
     /// Create a new, empty, instance of `Shared`.
     fn new() -> Self {
-        Shared {
+        // nicer and more idiomatic to use Self instead of repeating the type
+        Self {
             peers: HashMap::new(),
         }
     }
 
     /// Send a `LineCodec` encoded message to every peer, except for the sender.
-    async fn broadcast(&mut self, sender: SocketAddr, message: &str, room_id: String) {
-        for peer in self.peers.get_mut(&room_id.to_string()).unwrap().iter_mut() {
-            if peer.0 != sender {
-                let _ = peer.1.send(message.into());
-            }
-        }
+    // take things like SocketAddr by reference preferrably (though I think it might be Copy anyways)
+    // same with &str; unless you need String use &str
+    async fn broadcast(&mut self, sender: &SocketAddr, message: &str, room_id: &str) {
+        self.peers
+            // you probably can rework things so a broadcast, etc. is room specific,
+            // so you wouldn't need this lookup (and it couldn't fail that way)
+            .get_mut(room_id)
+            .expect("only call broadcast with an existing room_id")
+            .iter_mut()
+            // to me the functional way shows intent better
+            // your way is fine though
+            .filter(|(socket, _sx)| *socket != sender)
+            .map(|(_socket, sx)| sx)
+            .for_each(|sx| {
+                let _ = sx.send(message);
+            });
     }
 
-    async fn add_peer(
-        &mut self,
-        room_id: String,
-        sx: Sx,
-        peer: &Peer,
-    ) -> io::Result<()> {
+    async fn add_peer(&mut self, room_id: String, sx: Sx, peer: &Peer) -> io::Result<()> {
         let addr = peer.lines.get_ref().peer_addr()?;
-        let _test = self.peers
+        self.peers
             .entry(room_id)
             .or_default() // Default if doesn't exist
-            .push((addr, sx));
+            .insert(addr, sx);
         Ok(())
     }
 
-    async fn rm_peer(
-        &mut self,
-        roomid: String,
-        addr: SocketAddr,
-    ) -> io::Result<()>
-    {
-        let room_peers = self.peers.get_mut(&roomid.to_string()).unwrap();
-        for (idx, peer) in room_peers.iter().enumerate() {
-            if peer.0 == addr {
-                room_peers.remove(idx);
-                break;
-            }
-        }
-        Ok(())
+    async fn rm_peer(&mut self, room_id: &str, addr: &SocketAddr) {
+        self.peers
+            .get_mut(room_id)
+            .expect("only call rm_peer with an existing room_id")
+            // now that it's a HashMap you can easily remove in O(1)
+            .remove(addr);
     }
 }
 
 impl Peer {
     /// Create a new instance of `Peer`.
-    async fn new(
-        lines: Framed<TcpStream, LinesCodec>,
-    ) -> io::Result<(Peer, Sx)> {
+    // No need to be async or return a Result if you're not using await or returning errors
+    fn new(lines: Framed<TcpStream, LinesCodec>) -> (Self, Sx) {
         // Create a channel for this peer
         let (sx, rx) = mpsc::unbounded_channel();
         // Add an entry for this `Peer` in the shared state map.
-        Ok((Peer { lines, rx }, sx))
+        (Self { lines, rx }, sx)
     }
 }
 
-async fn cancel_tasks() -> Result<(), Box<dyn std::error::Error>>
-{
+// no need to return a result if it's always Ok(())
+async fn cancel_tasks() {
     println!("waiting for ctrl-c");
-    tokio::signal::ctrl_c().await.expect("failed to listen for event");
-   println!("received ctrl-c event");
-    Ok(())
+    tokio::signal::ctrl_c()
+        .await
+        .expect("failed to listen for event");
+    println!("received ctrl-c event");
 }
 
 /// Process an individual chat client
@@ -177,7 +181,10 @@ async fn process(
     state: Arc<Mutex<Shared>>,
     stream: TcpStream,
     addr: SocketAddr,
-) -> Result<(), Box<dyn Error>> {
+    // Box<dyn Error + Send + Sync + 'static> is better for errors
+    // and most errors should be that anyways
+    // you could also use the crate anyhow, which makes things more convenient
+) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     let mut lines = Framed::new(stream, LinesCodec::new());
     // Send a prompt to the client to enter their username.
     lines.send("Please enter your username:").await?;
@@ -191,17 +198,21 @@ async fn process(
         }
     };
     // Register our peer with state which internally sets up some channels.
-    let (mut peer, sx) = Peer::new(lines).await?;
+    let (mut peer, sx) = Peer::new(lines);
     // process line
-    let vec: Vec<&str> = line.split_whitespace().collect();
-    let (_cmd, roomid, username): (&str, &str, &str) = match vec.len() {
-        3 => {
-            if vec[0].to_uppercase() != "JOIN" {
+    // your way was fine but I prefer putting the Vec type in the call where it's used
+    let vec = line.split_whitespace().collect::<Vec<_>>();
+    let (_cmd, room_id, username) = match *vec.as_slice() {
+        // if you match as a slice, you don't need to keep indexing,
+        // which has bounds checking
+        // this way there's only 1 bounds check and you get to name the variables
+        [cmd, room_id, username] => {
+            if cmd.to_uppercase() != "JOIN" {
                 // TODO can I send this arm to the outermost _ arm?
                 tracing::error!("Incorrect input");
                 return Ok(());
             }
-            (vec[0], vec[1], vec[2])
+            (cmd, room_id, username)
         }
         _ => {
             // TODO this isn't sent in time
@@ -223,14 +234,14 @@ async fn process(
     // Add client to room
     {
         let mut state = state.lock().await;
-        state.add_peer(roomid.to_string(), sx, &peer).await?;
+        state.add_peer(room_id.to_string(), sx, &peer).await?;
     }
     // A client has connected, let's let everyone know.
     {
         let mut state = state.lock().await;
         let msg = format!("{} has joined the chat", username);
         tracing::info!("{}", msg);
-        state.broadcast(addr, &msg, roomid.into()).await;
+        state.broadcast(&addr, msg.as_str(), room_id).await;
     }
     // Process incoming messages until our stream is exhausted by a disconnect.
     loop {
@@ -245,8 +256,7 @@ async fn process(
                 Some(Ok(msg)) => {
                     let mut state = state.lock().await;
                     let msg = format!("{}: {}", username, msg);
-
-                    state.broadcast(addr, &msg, roomid.to_string()).await;
+                    state.broadcast(&addr, msg.as_str(), room_id).await;
                 }
                 // An error occurred.
                 Some(Err(e)) => {
@@ -265,10 +275,10 @@ async fn process(
     // Let's let everyone still connected know about it.
     {
         let mut state = state.lock().await;
-        state.rm_peer(roomid.to_string(), addr).await?;
+        state.rm_peer(room_id, &addr).await;
         let msg = format!("{} has left the chat", username);
         tracing::info!("{}", msg);
-        state.broadcast(addr, &msg, roomid.to_string()).await;
+        state.broadcast(&addr, msg.as_str(), room_id).await;
     }
     Ok(())
 }
