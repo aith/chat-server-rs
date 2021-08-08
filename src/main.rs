@@ -134,7 +134,7 @@ impl Shared {
             .filter(|(socket, _sx)| *socket != sender)
             .map(|(_socket, sx)| sx)
             .for_each(|sx| {
-                let _ = sx.send(message);
+                let _ = sx.send(message.into());
             });
     }
 
