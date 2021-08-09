@@ -26,10 +26,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let default_host = "0.0.0.0";
 
     let state = Arc::new(Mutex::new(Shared::new())); // Shared state
-    let addr = env::args()
+    let port = env::args()
         .nth(1)
-        // format!'s nicer here
-        .unwrap_or_else(|| format!("{}:{}", default_host, default_port));
+        .unwrap_or_else(|| default_port.to_string());
+    let addr = format!("{}:{}",default_host, port);
+
     let listener = TcpListener::bind(&addr).await?;
 
     tracing::info!("server running on {}", addr);
