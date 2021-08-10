@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 use std::env;
 use std::error::Error;
-use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -11,122 +10,44 @@ use bytes::BytesMut;
 use halfbrown; // For efficient Room size-based lookup & search
 
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, RwLock}; // Tokio's RwLock has a solid fairness policy
+use tokio::sync::{mpsc, RwLock};
+// Tokio's RwLock has a solid fairness policy
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::io::{AsyncReadExt, BufReader, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
-/// Send half of channel
-type Sx = mpsc::UnboundedSender<String>;
-/// Receive half of channel
-type Rx = mpsc::UnboundedReceiver<String>;
+// For printing logs to stdout
+use tracing_subscriber::{FmtSubscriber};
 
-/// Data that is shared between all peers in the chat server.
-struct SharedMemory {
-    rooms: halfbrown::HashMap<String, Room>, // Must be locked before writes to avoid data conflicts
-}
-
-impl SharedMemory {
-    /// Create a new, empty, instance of `Shared`.
-    fn new() -> Self {
-        Self {
-            // Halfbrown: uses Vec at low count (>32) for faster iterations
-            //            but switches to HashMap after that for faster lookup
-            rooms: halfbrown::HashMap::new(),
-        }
-    }
-
-    fn get_room(&self, key: &str) -> &Room {
-        return self.rooms.get(key).expect("Room does not exist");
-    }
-
-    fn get_room_mut(&mut self, key: &str) -> &mut Room {
-        return self.rooms.entry(key.to_string()).or_insert(Room::new());
-    }
-}
-
-/// The state for each connected client.
-struct Peer {
-    reader: BufReader<OwnedReadHalf>,
-    rx: Rx,
-}
-
-impl Peer {
-    fn new(lines: BufReader<OwnedReadHalf>) -> (Self, Sx) {
-        // Create a channel for this peer
-        let (sx, rx) = mpsc::unbounded_channel();
-        // Add an entry for this `Peer` in the shared state map.
-        (Self { reader: lines, rx }, sx)
-    }
-}
-
-/// Contains Peers
-struct Room {
-    peers: HashMap<SocketAddr, Sx>,
-}
-
-impl Room {
-    fn new() -> Room {
-        Self { peers: Default::default() }
-    }
-
-    fn is_empty(&self) -> bool {
-        return self.peers.len() <= 0
-    }
-
-    fn add_peer(&mut self, sx: Sx, peer: &SocketAddr) -> io::Result<()> {
-        // let addr = peer.lines.into_inner().as_ref().peer_addr()?;
-        let addr = peer;
-        self.peers.insert(*addr, sx);
-        Ok(())
-    }
-
-    fn rm_peer(&mut self, addr: &SocketAddr) -> io::Result<()> {
-        self.peers.remove(addr);
-        Ok(())
-    }
-
-    /// Send a message ot each Peer in the Room
-    async fn broadcast(&self, message: &str) {
-        self.peers
-            .iter()
-            // .filter(|(socket, _sx)| *socket != sender)
-            .map(|(_socket, sx)| sx)
-            .for_each(|sx| {
-                let _ = sx.send(message.into());
-            });
-    }
-}
-
+/// Run Server
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    // Init Logging
+    let _subscriber = FmtSubscriber::new();
+    // To print log to stdout, enable the following lines
+    // let _ = tracing::subscriber::set_global_default(_subscriber)
+    //     .map_err(|_err| eprintln!("Unable to set global default subscriber")).unwrap();
+
+    //Get Connection
     let default_port = 1234u16;
     let default_host = "0.0.0.0";
-    let state = Arc::new(
-        RwLock::new(
-            SharedMemory::new()));
-    // Process input port
-    let port = env::args()
-        .nth(1)
-        .unwrap_or_else(|| {
-            println!("Using default port: 1234");
-            default_port.to_string()
-        });
+    let state = Arc::new(RwLock::new(SharedMemory::new()));
+    let port = get_port(default_port);
     let addr = format!("{}:{}", default_host, port);
-    let listener = TcpListener::bind(&addr).await
-        .expect("Port could not be acquired. Is it in use?");  // Safely exit
-    tracing::info!("server running on {}", addr);
+    let listener = TcpListener::bind(&addr).await.expect("Port could not be acquired");
+    tracing::info!("Server started on: {}", addr);
     tokio::spawn(async move {
         loop {
-            // Asynchronously wait for an inbound TcpStream.
+            // async wait for an inbound TcpStream
             let (stream, addr) = listener.accept().await.unwrap();
-            // Clone a handle to the `Shared` state for the new connection.
+            tracing::info!("Server accepted: {}", stream.peer_addr()
+                .expect("Could not get address of new connection").to_string());
+            // clone a handle to the `Shared` state for the new connection.
             let state = state.clone(); // Get & increase ref counts
-            // Spawn our handler to be run asynchronously.
+            // spawn our handler to be run asynchronously.
             tokio::spawn(async move {
-                tracing::debug!("accepted connection");
-                if let Err(e) = process(state, stream, addr).await {
-                    tracing::info!("an error occurred; error = {:?}", e);
+                if let Err(e) = process_client(state, stream, addr).await {
+                    tracing::error!("Server error: {:?}", e);
                 }
             });
         }
@@ -136,12 +57,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
 }
 
 /// Process an individual chat client
-async fn process(
+async fn process_client(
     state: Arc<RwLock<SharedMemory>>,
     stream: TcpStream,
     addr: SocketAddr,
 ) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
-
     let msg_max = 20000usize;
     let mut buffer = BytesMut::with_capacity(1000);
     let (reader, mut writer) = stream.into_split();
@@ -167,25 +87,23 @@ async fn process(
                 || is_oob(&username)
                 || !username.is_ascii()
                 || !room_id.is_ascii()
-            { return send_user_err(&mut writer).await; }
-            else { (cmd, room_id, username) }
+            { return send_user_err(&mut writer).await; } else { (cmd, room_id, username) }
         }
         _ => { return send_user_err(&mut writer).await; }
     };
-    // Register our peer with state which internally sets up some channels.
+    // Register our Peer with state which internally sets up some channels
     let (mut peer, sx) = Peer::new(reader);
     {
-        // Add client to room, let go of lock after
         let mut state = state.write().await;
         let room = state.get_room_mut(room_id);
-        room.add_peer(sx, &addr).expect("Could not add peer to room");
+        room.add_peer(sx, &addr);
+        tracing::info!("+Room {}, User: {}", room_id, username);
     }
+    // Alert all other Peers in the Room of new Peer
     {
-        // A client has connected, let's let everyone know.
         let state = state.read().await;
         let room = state.get_room(room_id);
         let msg = format!("{} has joined\n", username);
-        tracing::info!("{}", msg);
         room.broadcast(msg.as_str()).await;
     }
     buffer.clear();
@@ -199,24 +117,25 @@ async fn process(
                         match limited_read(&mut peer.reader, &mut buffer, bytes_read, msg_max).await {
                             Ok(()) => {
                                 let msg = std::str::from_utf8(&buffer).unwrap();
-                                let mut state = state.read().await;
+                                let state = state.read().await;
                                 let msg = format!("{}: {}", username, msg);
+                                tracing::info!("+Message: {}", msg);
                                 let room = state.get_room(room_id);
                                 room.broadcast(msg.as_str()).await;
                             },
                             _ => {  // Large message -> kick user
-                                tracing::info!("Large message ignored.");
                                 send_user_err(&mut writer).await.expect("Could not send user err.");
+                                tracing::warn!("-User {} tried to sent massive message.", username);
                                 break;
                             }
                         }
                     },
-                    _ => { // IO Error
-                        tracing::info!("IO Error while receiving message.");
+                    _ => {
+                        tracing::warn!("-User {} IO Error.", username);
                         break;
                     },
                 }
-                buffer.clear();
+                buffer.clear();  // Reuse buffer
             }
             // A message was received from a peer. Send it to the current user.
             Some(msg) = peer.rx.recv() => {
@@ -228,9 +147,9 @@ async fn process(
         // Exit Client
         let mut state = state.write().await;
         let room = state.get_room_mut(room_id);
-        room.rm_peer(&addr).expect("Could not remove peer");
+        room.rm_peer(&addr);
         let msg = format!("{} has left\n", username);
-        tracing::info!("{}", msg);
+        tracing::info!("-Room {}, User: {}", room_id, username);
         room.broadcast(msg.as_str()).await;
         if room.is_empty() { state.rooms.remove(room_id); }
     }
@@ -251,35 +170,37 @@ async fn limited_read(
         let bytes_read = buf_reader.read_buf(buf).await.unwrap();
         num_bytes += bytes_read;
         if num_bytes > lim_bytes {
-            tracing::info!("User inputted too large of a message");
             return Err("Too large of a buffer.");
         }
     }
     Ok(())
 }
 
+/// Write generic ERROR message to peer connection
 async fn send_user_err(writer: &mut OwnedWriteHalf)
--> Result<(), Box<(dyn std::error::Error + Sync + std::marker::Send + 'static)>>
+    -> Result<(), Box<(dyn std::error::Error + Sync + std::marker::Send + 'static)>>
 {
     writer.write_all(b"ERROR\n").await.unwrap();
     Ok(())
 }
 
+/// Signal Handler
 async fn handle_signals() -> Result<(), Box<dyn std::error::Error>>
 {
     let mut term = signal(SignalKind::terminate())?;
     tokio::select! {
         _option = tokio::signal::ctrl_c() => {
-            tracing::info!("Received SIGINT");
+            tracing::info!("Server shutting down on SIGINT");
             Ok(())
         },
         _option = term.recv() => {
-            tracing::info!("Received SIGTERM");
+            tracing::info!("Server shutting down on SIGINT");
             Ok(())
         }
     }
 }
 
+/// Check if str is out of the 1-20 characters length bounds
 fn is_oob(st: &str) -> bool {
     let length = st.len();
     return length < 1 || length > 20;
@@ -287,4 +208,93 @@ fn is_oob(st: &str) -> bool {
 
 fn bytes_to_str(buf: &BytesMut) -> String {
     std::str::from_utf8(&buf.to_vec()).expect("Could not convert bytes to str").to_string()
+}
+
+/// Return inputted Port or default Port
+fn get_port(default: u16) -> String {
+    env::args()
+        .nth(1)
+        .unwrap_or_else(|| {
+            println!("Using default port: 1234");
+            default.to_string()
+        })
+}
+
+/// Send half of channel
+type Sx = mpsc::UnboundedSender<String>;
+/// Receive half of channel
+type Rx = mpsc::UnboundedReceiver<String>;
+
+/// Memory that each thread & task shares
+struct SharedMemory {
+    // Halfbrown: uses Vec at low count (>32) for faster iterations
+    //            but switches to HashMap after that for faster lookup
+    rooms: halfbrown::HashMap<String, Room>,
+}
+
+impl SharedMemory {
+    /// Create a new, empty, instance of `Shared`.
+    fn new() -> Self {
+        Self {
+            rooms: halfbrown::HashMap::new(),
+        }
+    }
+
+    fn get_room(&self, key: &str) -> &Room {
+        return self.rooms.get(key).expect("Room does not exist");
+    }
+
+    fn get_room_mut(&mut self, key: &str) -> &mut Room {
+        return self.rooms.entry(key.to_string()).or_insert(Room::new());
+    }
+}
+
+/// Connected Client
+struct Peer {
+    reader: BufReader<OwnedReadHalf>,
+    rx: Rx,
+}
+
+impl Peer {
+    fn new(lines: BufReader<OwnedReadHalf>) -> (Self, Sx) {
+        // Create a channel for this peer
+        let (sx, rx) = mpsc::unbounded_channel();
+        // Add an entry for this `Peer` in the shared state map.
+        (Self { reader: lines, rx }, sx)
+    }
+}
+
+/// Contains Peers
+struct Room {
+    peers: HashMap<SocketAddr, Sx>,
+}
+
+impl Room {
+    fn new() -> Room {
+        Self { peers: Default::default() }
+    }
+
+    fn is_empty(&self) -> bool {
+        return self.peers.len() <= 0;
+    }
+
+    fn add_peer(&mut self, sx: Sx, peer_addr: &SocketAddr) {
+        // TODO change to try_insert when stable
+        self.peers.insert(*peer_addr, sx);
+    }
+
+    fn rm_peer(&mut self, peer_addr: &SocketAddr) {
+        self.peers.remove(peer_addr);
+    }
+
+    /// Send a message ot each Peer in the Room
+    async fn broadcast(&self, message: &str) {
+        self.peers
+            .iter()
+            // .filter(|(socket, _sx)| *socket != sender)
+            .map(|(_socket, sx)| sx)
+            .for_each(|sx| {
+                let _ = sx.send(message.into());
+            });
+    }
 }
