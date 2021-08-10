@@ -78,7 +78,15 @@ async fn process_client(
         }
     }
     // Parse line
-    let line = bytes_to_str(&buffer); // The JOIN command line
+    let line = match std::str::from_utf8(&buffer.to_vec()) {
+        Ok(msg) => { msg.to_string() },
+        _ => {
+            tracing::warn!("Cannot parse line from {} into utf8.", addr);
+            return send_user_err(&mut writer).await
+        }
+    };
+
+    // Get JOIN, Room name, and Peer name
     let vec = line.split_whitespace().collect::<Vec<_>>(); // Split words across vec
     let (_cmd, room_id, username) = match *vec.as_slice() {
         [cmd, room_id, username] => {
@@ -116,12 +124,19 @@ async fn process_client(
                         if bytes_read == 0 { break; } // Peer left
                         match limited_read(&mut peer.reader, &mut buffer, bytes_read, msg_max).await {
                             Ok(()) => {
-                                let msg = std::str::from_utf8(&buffer).unwrap();
-                                let state = state.read().await;
-                                let msg = format!("{}: {}", username, msg);
-                                tracing::info!("+Message: {}", msg);
-                                let room = state.get_room(room_id);
-                                room.broadcast(msg.as_str()).await;
+                                match std::str::from_utf8(&buffer) {
+                                    Ok(msg) => {
+                                        let state = state.read().await;
+                                        let msg = format!("{}: {}", username, msg);
+                                        tracing::info!("+Message: {}", msg);
+                                        let room = state.get_room(room_id);
+                                        room.broadcast(msg.as_str()).await;
+                                    },
+                                    _ => {
+                                        // User entered non-utf8 message, so ignore it
+                                        tracing::warn!("Cannot parse {}'s msg into utf8.", username);
+                                    }
+                                }
                             },
                             _ => {  // Large message -> kick user
                                 send_user_err(&mut writer).await.expect("Could not send user err.");
@@ -178,7 +193,7 @@ async fn limited_read(
 
 /// Write generic ERROR message to peer connection
 async fn send_user_err(writer: &mut OwnedWriteHalf)
-    -> Result<(), Box<(dyn std::error::Error + Sync + std::marker::Send + 'static)>>
+                       -> Result<(), Box<(dyn std::error::Error + Sync + std::marker::Send + 'static)>>
 {
     writer.write_all(b"ERROR\n").await.unwrap();
     Ok(())
@@ -204,10 +219,6 @@ async fn handle_signals() -> Result<(), Box<dyn std::error::Error>>
 fn is_oob(st: &str) -> bool {
     let length = st.len();
     return length < 1 || length > 20;
-}
-
-fn bytes_to_str(buf: &BytesMut) -> String {
-    std::str::from_utf8(&buf.to_vec()).expect("Could not convert bytes to str").to_string()
 }
 
 /// Return inputted Port or default Port
