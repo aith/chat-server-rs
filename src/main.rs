@@ -7,17 +7,14 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::BytesMut;
-use halfbrown; // For efficient Room size-based lookup & search
-
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, RwLock};
-// Tokio's RwLock has a solid fairness policy
-use tokio::signal::unix::{signal, SignalKind};
-use tokio::io::{AsyncReadExt, BufReader, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-
+use tokio::net::{TcpListener, TcpStream};
+use tokio::signal::unix::{signal, SignalKind};
+// Tokio's RwLock has a solid fairness policy
+use tokio::sync::{mpsc, RwLock};
 // For printing logs to stdout
-use tracing_subscriber::{FmtSubscriber};
+use tracing_subscriber::FmtSubscriber;
 
 /// Run Server
 #[tokio::main]
@@ -34,16 +31,34 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let state = Arc::new(RwLock::new(SharedMemory::new()));
     let port = get_port(default_port);
     let addr = format!("{}:{}", default_host, port);
-    let listener = TcpListener::bind(&addr).await.expect("Port could not be acquired");
+    let listener = TcpListener::bind(&addr)
+        .await
+        // expect ok b/c rest of the program can't be run if this fails, so panic ok
+        .expect("Port could not be acquired");
     tracing::info!("Server started on: {}", addr);
     tokio::spawn(async move {
         loop {
             // async wait for an inbound TcpStream
-            let (stream, addr) = listener.accept().await.unwrap();
-            tracing::info!("Server accepted: {}", stream.peer_addr()
-                .expect("Could not get address of new connection").to_string());
+            // don't unwrap these b/c it'll panic, just re-start the loop w/ a continue
+            let (stream, addr) = match listener.accept().await {
+                Ok(it) => it,
+                Err(e) => {
+                    tracing::error!("accept error: {}", e);
+                    continue;
+                }
+            };
+            tracing::info!(
+                "Server accepted: {}",
+                stream
+                    .peer_addr()
+                    .map(|it| it.to_string())
+                    // similar don't unwrap/expect this in case that panics
+                    // just use a default message
+                    .unwrap_or_else(|_| "Could not get address of new connection".into())
+            );
             // clone a handle to the `Shared` state for the new connection.
             let state = state.clone(); // Get & increase ref counts
+
             // spawn our handler to be run asynchronously.
             tokio::spawn(async move {
                 if let Err(e) = process_client(state, stream, addr).await {
@@ -68,7 +83,9 @@ async fn process_client(
     let mut reader = BufReader::new(reader);
 
     // Send a prompt to the client to enter their username.
-    writer.write_all(b"Welcome! Use the command:\nJOIN <ROOMNAME> <USERNAME>\n").await?;
+    writer
+        .write_all(b"Welcome! Use the command:\nJOIN <ROOMNAME> <USERNAME>\n")
+        .await?;
 
     // Keep reading into buffer until newline is found
     match limited_read(&mut reader, &mut buffer, 0, msg_max).await {
@@ -78,11 +95,12 @@ async fn process_client(
         }
     }
     // Parse line
+    // Don't do UTF-8 check, keep storing as &[u8], Box<[u8]>, or Vec<u8>
     let line = match std::str::from_utf8(&buffer.to_vec()) {
-        Ok(msg) => { msg.to_string() },
+        Ok(msg) => msg.to_string(),
         _ => {
             tracing::warn!("Cannot parse line from {} into utf8.", addr);
-            return send_user_err(&mut writer).await
+            return send_user_err(&mut writer).await;
         }
     };
 
@@ -91,16 +109,25 @@ async fn process_client(
     let (_cmd, room_id, username) = match *vec.as_slice() {
         [cmd, room_id, username] => {
             if cmd.to_uppercase() != "JOIN"
-                || is_oob(&room_id)
-                || is_oob(&username)
+                || is_oob(room_id)
+                || is_oob(username)
                 || !username.is_ascii()
                 || !room_id.is_ascii()
-            { return send_user_err(&mut writer).await; } else { (cmd, room_id, username) }
+            {
+                return send_user_err(&mut writer).await;
+            } else {
+                (cmd, room_id, username)
+            }
         }
-        _ => { return send_user_err(&mut writer).await; }
+        _ => {
+            return send_user_err(&mut writer).await;
+        }
     };
     // Register our Peer with state which internally sets up some channels
     let (mut peer, sx) = Peer::new(reader);
+    // btw I meant putting a lock around each room
+    // that way you just do 1 state.get_room_mut(room_id) lookup at the beginning
+    // and then lock the room instead of the whole state each time you access it
     {
         let mut state = state.write().await;
         let room = state.get_room_mut(room_id);
@@ -121,12 +148,15 @@ async fn process_client(
             result = peer.reader.read_buf(&mut buffer) => {
                 match result {
                     Ok(bytes_read) => {
+                        // I'd refactor this code into a separate function, just cause it's getting very deep
                         if bytes_read == 0 { break; } // Peer left
                         match limited_read(&mut peer.reader, &mut buffer, bytes_read, msg_max).await {
                             Ok(()) => {
                                 match std::str::from_utf8(&buffer) {
                                     Ok(msg) => {
                                         let state = state.read().await;
+                                        // also be careful about format! b/c it uses String
+                                        // so can't work if msg is not UTF-8
                                         let msg = format!("{}: {}", username, msg);
                                         tracing::info!("+Message: {}", msg);
                                         let room = state.get_room(room_id);
@@ -139,7 +169,10 @@ async fn process_client(
                                 }
                             },
                             _ => {  // Large message -> kick user
-                                send_user_err(&mut writer).await.expect("Could not send user err.");
+                                // don't panic in expect
+                                if let Err(e) = send_user_err(&mut writer).await {
+                                    tracing::error!("Could not send user err: {}", e);
+                                }
                                 tracing::warn!("-User {} tried to sent massive message.", username);
                                 break;
                             }
@@ -166,7 +199,9 @@ async fn process_client(
         let msg = format!("{} has left\n", username);
         tracing::info!("-Room {}, User: {}", room_id, username);
         room.broadcast(msg.as_str()).await;
-        if room.is_empty() { state.rooms.remove(room_id); }
+        if room.is_empty() {
+            state.rooms.remove(room_id);
+        }
     }
     Ok(())
 }
@@ -178,10 +213,17 @@ async fn limited_read(
     buf_reader: &mut BufReader<OwnedReadHalf>,
     buf: &mut BytesMut,
     mut num_bytes: usize,
-    lim_bytes: usize) -> Result<(), &'static str>
-{
-    if num_bytes > lim_bytes { return Err("Too large of a buffer."); }
+    lim_bytes: usize,
+) -> Result<(), &'static str> {
+    if num_bytes > lim_bytes {
+        return Err("Too large of a buffer.");
+    }
+    // btw there's buf_reader.read_line() (from AsyncBufReadExt)
+    // but I guess you need to do the length check, too
+    // in that case maybe the LinesCodec was a good idea, oops (but just keep this now)
     while !buf.ends_with(&[b'\n']) {
+        // also, don't unwrap so much, b/c that will panic if the read fails,
+        // like if the user closes their socket I think
         let bytes_read = buf_reader.read_buf(buf).await.unwrap();
         num_bytes += bytes_read;
         if num_bytes > lim_bytes {
@@ -192,16 +234,15 @@ async fn limited_read(
 }
 
 /// Write generic ERROR message to peer connection
-async fn send_user_err(writer: &mut OwnedWriteHalf)
-                       -> Result<(), Box<(dyn std::error::Error + Sync + std::marker::Send + 'static)>>
-{
-    writer.write_all(b"ERROR\n").await.unwrap();
+async fn send_user_err(
+    writer: &mut OwnedWriteHalf,
+) -> Result<(), Box<dyn Error + Sync + Send + 'static>> {
+    writer.write_all(b"ERROR\n").await?;
     Ok(())
 }
 
 /// Signal Handler
-async fn handle_signals() -> Result<(), Box<dyn std::error::Error>>
-{
+async fn handle_signals() -> Result<(), Box<dyn Error>> {
     let mut term = signal(SignalKind::terminate())?;
     tokio::select! {
         _option = tokio::signal::ctrl_c() => {
@@ -218,17 +259,16 @@ async fn handle_signals() -> Result<(), Box<dyn std::error::Error>>
 /// Check if str is out of the 1-20 characters length bounds
 fn is_oob(st: &str) -> bool {
     let length = st.len();
-    return length < 1 || length > 20;
+    // clippy suggestion
+    !(1..=20).contains(&length)
 }
 
 /// Return inputted Port or default Port
 fn get_port(default: u16) -> String {
-    env::args()
-        .nth(1)
-        .unwrap_or_else(|| {
-            println!("Using default port: 1234");
-            default.to_string()
-        })
+    env::args().nth(1).unwrap_or_else(|| {
+        println!("Using default port: {}", default);
+        default.to_string()
+    })
 }
 
 /// Send half of channel
@@ -252,11 +292,12 @@ impl SharedMemory {
     }
 
     fn get_room(&self, key: &str) -> &Room {
-        return self.rooms.get(key).expect("Room does not exist");
+        // expect ok here b/c key should statically be known to exist
+        self.rooms.get(key).expect("Room does not exist")
     }
 
     fn get_room_mut(&mut self, key: &str) -> &mut Room {
-        return self.rooms.entry(key.to_string()).or_insert(Room::new());
+        self.rooms.entry(key.into()).or_insert(Room::new())
     }
 }
 
@@ -276,17 +317,18 @@ impl Peer {
 }
 
 /// Contains Peers
+#[derive(Default)]
 struct Room {
     peers: HashMap<SocketAddr, Sx>,
 }
 
 impl Room {
     fn new() -> Room {
-        Self { peers: Default::default() }
+        Self::default()
     }
 
     fn is_empty(&self) -> bool {
-        return self.peers.len() <= 0;
+        self.peers.is_empty()
     }
 
     fn add_peer(&mut self, sx: Sx, peer_addr: &SocketAddr) {
@@ -300,12 +342,8 @@ impl Room {
 
     /// Send a message ot each Peer in the Room
     async fn broadcast(&self, message: &str) {
-        self.peers
-            .iter()
-            // .filter(|(socket, _sx)| *socket != sender)
-            .map(|(_socket, sx)| sx)
-            .for_each(|sx| {
-                let _ = sx.send(message.into());
-            });
+        self.peers.iter().map(|(_socket, sx)| sx).for_each(|sx| {
+            let _ = sx.send(message.into());
+        });
     }
 }
