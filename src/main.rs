@@ -11,7 +11,7 @@ use bytes::BytesMut;
 use halfbrown; // For efficient Room size-based lookup & search
 
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, RwLock}; // Tokio's RwLock has a solid fairness policy
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::io::{AsyncReadExt, BufReader, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -36,8 +36,12 @@ impl SharedMemory {
         }
     }
 
-    fn get_room(&mut self, key: String) -> &mut Room {
-        return self.rooms.entry(key).or_insert(Room::new());
+    fn get_room(&self, key: &str) -> &Room {
+        return self.rooms.get(key).expect("Room does not exist");
+    }
+
+    fn get_room_mut(&mut self, key: &str) -> &mut Room {
+        return self.rooms.entry(key.to_string()).or_insert(Room::new());
     }
 }
 
@@ -83,9 +87,9 @@ impl Room {
     }
 
     /// Send a message ot each Peer in the Room
-    async fn broadcast(&mut self, message: &str) {
+    async fn broadcast(&self, message: &str) {
         self.peers
-            .iter_mut()
+            .iter()
             // .filter(|(socket, _sx)| *socket != sender)
             .map(|(_socket, sx)| sx)
             .for_each(|sx| {
@@ -98,7 +102,9 @@ impl Room {
 async fn main() -> Result<(), Box<dyn Error>> {
     let default_port = 1234u16;
     let default_host = "0.0.0.0";
-    let state = Arc::new(Mutex::new(SharedMemory::new()));
+    let state = Arc::new(
+        RwLock::new(
+            SharedMemory::new()));
     // Process input port
     let port = env::args()
         .nth(1)
@@ -131,7 +137,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 /// Process an individual chat client
 async fn process(
-    state: Arc<Mutex<SharedMemory>>,
+    state: Arc<RwLock<SharedMemory>>,
     stream: TcpStream,
     addr: SocketAddr,
 ) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
@@ -170,14 +176,14 @@ async fn process(
     let (mut peer, sx) = Peer::new(reader);
     {
         // Add client to room, let go of lock after
-        let mut state = state.lock().await;
-        let room = state.get_room(room_id.to_string());
+        let mut state = state.write().await;
+        let room = state.get_room_mut(room_id);
         room.add_peer(sx, &addr).expect("Could not add peer to room");
     }
     {
         // A client has connected, let's let everyone know.
-        let mut state = state.lock().await;
-        let room = state.get_room(room_id.to_string());
+        let state = state.read().await;
+        let room = state.get_room(room_id);
         let msg = format!("{} has joined\n", username);
         tracing::info!("{}", msg);
         room.broadcast(msg.as_str()).await;
@@ -193,9 +199,9 @@ async fn process(
                         match limited_read(&mut peer.reader, &mut buffer, bytes_read, msg_max).await {
                             Ok(()) => {
                                 let msg = std::str::from_utf8(&buffer).unwrap();
-                                let mut state = state.lock().await;
+                                let mut state = state.read().await;
                                 let msg = format!("{}: {}", username, msg);
-                                let room = state.get_room(room_id.to_string());
+                                let room = state.get_room(room_id);
                                 room.broadcast(msg.as_str()).await;
                             },
                             _ => {  // Large message -> kick user
@@ -220,8 +226,8 @@ async fn process(
     }
     {
         // Exit Client
-        let mut state = state.lock().await;
-        let room = state.get_room(room_id.to_string());
+        let mut state = state.write().await;
+        let room = state.get_room_mut(room_id);
         room.rm_peer(&addr).expect("Could not remove peer");
         let msg = format!("{} has left\n", username);
         tracing::info!("{}", msg);
