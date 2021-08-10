@@ -12,6 +12,7 @@ tokio-util = { version = "0.6.3",features = ["full"] }
 tokio-stream = { version = "0.1" }
 halfbrown = "0.1.11"
 bytes = "1.0.1"
+format-bytes = "0.2.2"
 #tokio-signal = "0.3.0-alpha.1"
 
 tracing = "0.1"
