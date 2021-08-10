@@ -102,9 +102,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Process input port
     let port = env::args()
         .nth(1)
-        .unwrap_or_else(|| default_port.to_string());
+        .unwrap_or_else(|| {
+            println!("Using default port: 1234");
+            default_port.to_string()
+        });
     let addr = format!("{}:{}", default_host, port);
-    let listener = TcpListener::bind(&addr).await?;
+    let listener = TcpListener::bind(&addr).await
+        .expect("Port could not be acquired. Is it in use?");  // Safely exit
     tracing::info!("server running on {}", addr);
     tokio::spawn(async move {
         loop {
@@ -138,7 +142,7 @@ async fn process(
     let mut reader = BufReader::new(reader);
 
     // Send a prompt to the client to enter their username.
-    writer.write_all(b"Please enter your username:\n").await?;
+    writer.write_all(b"Welcome! Use the command:\nJOIN <ROOMNAME> <USERNAME>\n").await?;
 
     // Keep reading into buffer until newline is found
     match limited_read(&mut reader, &mut buffer, 0, msg_max).await {
@@ -194,7 +198,11 @@ async fn process(
                                 let room = state.get_room(room_id.to_string());
                                 room.broadcast(msg.as_str()).await;
                             },
-                            _ => { tracing::info!("Large message ignored."); } // Ignore message
+                            _ => {  // Large message -> kick user
+                                tracing::info!("Large message ignored.");
+                                send_user_err(&mut writer).await.expect("Could not send user err.");
+                                break;
+                            }
                         }
                     },
                     _ => { // IO Error
