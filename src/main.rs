@@ -20,6 +20,23 @@ use std::io::ErrorKind;
 
 use clap::{Arg, App, ArgMatches};
 
+fn setup_args() -> ArgMatches {
+    App::new("A Chat Server :)")
+        .version("1.0")
+        .author("ari i")
+        .about("Multi-user, multi-room chat server")
+        .arg(Arg::new("port")
+            .index(1)
+            .required(false)
+        )
+        .arg(Arg::new("is_pretty_printing")
+            .short('v')
+            .long("verbose")
+            .required(false)
+        )
+        .get_matches()
+}
+
 /// Run Server
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -29,13 +46,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let port = matches.value_of("port").unwrap_or_else(|| default_port);
     // Init Logging
     if matches.is_present("is_pretty_printing") {
-        let _subscriber = FmtSubscriber::new();
-        let _ = tracing::subscriber::set_global_default(_subscriber)
+        let subscriber = FmtSubscriber::new();
+        let _ = tracing::subscriber::set_global_default(subscriber)
             .map_err(|_err| eprintln!("Unable to set global default subscriber")).unwrap();
     }
     //Get Connection
     let state = Arc::new(RwLock::new(SharedMemory::new()));
-
     let addr = format!("{}:{}", default_host, port);
     let listener = TcpListener::bind(&addr).await.expect("Couldn't acquire port.");
     tracing::info!("Server started on: {}", addr);
@@ -105,6 +121,7 @@ async fn process_client( state: Arc<RwLock<SharedMemory>>, stream: TcpStream, ad
     Ok(())
 }
 
+/// Take cmd like JOIN ROOMNAME USERNAME
 async fn get_cmd(addr: &SocketAddr, line: &String)
     -> Result<(String, String, String), Box<dyn Error + Send + Sync + 'static>>
 {
@@ -131,6 +148,7 @@ async fn get_cmd(addr: &SocketAddr, line: &String)
     Err(std::io::Error::new(ErrorKind::InvalidInput, format!("Invalid command from {}", addr)))?
 }
 
+/// Create new peer connection and add it to Shared Memory & Room
 async fn create_peer(sx: Sx, peer_addr: &SocketAddr, state: &Arc<RwLock<SharedMemory>>, room_id: &str, username: &str)
     -> Result<(), Box<dyn Error + Send + Sync + 'static>>
 {
@@ -141,6 +159,7 @@ async fn create_peer(sx: Sx, peer_addr: &SocketAddr, state: &Arc<RwLock<SharedMe
     Ok(())
 }
 
+/// Tell peers in same Room that a new Peer has joined
 async fn alert_peers(state: &Arc<RwLock<SharedMemory>>, room_id: &str, username: &str)
     -> Result<(), Box<dyn Error + Send + Sync + 'static>>
 {
@@ -320,19 +339,3 @@ impl Room {
     }
 }
 
-fn setup_args() -> ArgMatches {
-    App::new("A Chat Server :)")
-        .version("1.0")
-        .author("ari i")
-        .about("Multi-user, multi-room chat server")
-        .arg(Arg::new("port")
-            .index(1)
-            .required(false)
-        )
-        .arg(Arg::new("is_pretty_printing")
-            .short('v')
-            .long("verbose")
-            .required(false)
-        )
-        .get_matches()
-}

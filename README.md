@@ -1,4 +1,5 @@
 ## Simple Multi-user, Multi-room Asynchronous Chat Server
+by ari i
 
 + Uses Tokio for multi-threaded, concurrent async IO for massive scalability
 + Rooms hold Peers in a HalfBrown container for fast size-dependent lookup & 
@@ -28,4 +29,14 @@ dynamically-allocated rooms & users structures.
 ## Building
 ```sh
 cargo build --release
+```
+
+## Running
+Without logging to stdout:
+```sh
+cargo build --release <port_id>
+```
+With logging to stdout:
+```sh
+cargo build --release <port_id> -v
 ```
