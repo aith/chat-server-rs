@@ -34,9 +34,17 @@ cargo build --release
 ## Running
 Without logging to stdout:
 ```sh
-cargo build --release <port_id>
+cargo run <port_id>
 ```
 With logging to stdout:
 ```sh
-cargo build --release <port_id> -v
+cargo run <port_id> -v
 ```
+
+## Joining
+If joining on your machine, you can use localhost as your address:
+```sh
+telnet <address> <port_id>
+```
+
+Tested on Ubuntu 20.04
