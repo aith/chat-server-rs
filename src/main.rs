@@ -1,7 +1,6 @@
 #![warn(rust_2018_idioms)]
 
 use std::collections::HashMap;
-use std::env;
 use std::error::Error;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -17,21 +16,26 @@ use tracing_subscriber::FmtSubscriber;
 
 use tokio_util::codec::{Framed, LinesCodec};
 use futures::SinkExt;
+use std::io::ErrorKind;
+
+use clap::{Arg, App, ArgMatches};
 
 /// Run Server
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    // Init Logging
-    let _subscriber = FmtSubscriber::new();
-    // To print log to stdout, enable the following lines
-    let _ = tracing::subscriber::set_global_default(_subscriber)
-        .map_err(|_err| eprintln!("Unable to set global default subscriber")).unwrap();
-
-    //Get Connection
-    let default_port = 1234u16;
+    let default_port = "1234";
     let default_host = "0.0.0.0";
+    let matches = setup_args();
+    let port = matches.value_of("port").unwrap_or_else(|| default_port);
+    // Init Logging
+    if matches.is_present("is_pretty_printing") {
+        let _subscriber = FmtSubscriber::new();
+        let _ = tracing::subscriber::set_global_default(_subscriber)
+            .map_err(|_err| eprintln!("Unable to set global default subscriber")).unwrap();
+    }
+    //Get Connection
     let state = Arc::new(RwLock::new(SharedMemory::new()));
-    let port = get_port(default_port);
+
     let addr = format!("{}:{}", default_host, port);
     let listener = TcpListener::bind(&addr).await.expect("Couldn't acquire port.");
     tracing::info!("Server started on: {}", addr);
@@ -66,31 +70,46 @@ async fn main() -> Result<(), Box<dyn Error>> {
 }
 
 /// Process an individual chat client
-async fn process_client(
-    state: Arc<RwLock<SharedMemory>>,
-    stream: TcpStream,
-    addr: SocketAddr,
-) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+async fn process_client( state: Arc<RwLock<SharedMemory>>, stream: TcpStream, addr: SocketAddr,)
+    -> Result<(), Box<dyn Error + Send + Sync + 'static>>
+{
     let msg_max = 20000usize;
     let mut line_stream = Framed::new(
         stream,
         LinesCodec::new_with_max_length(msg_max) // To prevent DoS
     );
-
     // Send a prompt to the client to enter their username.
     line_stream .send("Welcome! Use the command:\nJOIN <ROOMNAME> <USERNAME>") .await?;
-
     // Parse line
     let line = match line_stream.next().await {
         Some(Ok(msg)) => msg,
         _ => {
-            tracing::warn!("Cannot parse line from {} into utf8.", addr);
+            tracing::warn!("Cannot parse line from {}.", addr);
             return send_user_err(&mut line_stream).await;
         }
     };
-    // Get JOIN, Room name, and Peer name
+    let (_cmd, room_id, username)  = match get_cmd(&addr, &line).await {
+        Ok((cmd, room_id, username)) => { (cmd, room_id, username) },
+        _ => {
+            let _ = send_user_err(&mut line_stream).await;
+            return Ok(());
+        }
+    };
+    let room_id = &room_id; // Convert to &str to comply with Lifetimes TODO make succinct
+    let username = &username;
+    let (mut peer, sx) = Peer::new(line_stream);
+    let _ = create_peer(sx, &addr, &state, room_id, username).await;
+    let _ = alert_peers(&state, room_id, username).await;
+    let _ = handle_messaging(&mut peer, &state, room_id, username).await;
+    let _ = exit_client(&addr, &state, room_id, username).await;
+    Ok(())
+}
+
+async fn get_cmd(addr: &SocketAddr, line: &String)
+    -> Result<(String, String, String), Box<dyn Error + Send + Sync + 'static>>
+{
     let vec = line.split_whitespace().collect::<Vec<_>>(); // Split words across vec
-    let (_cmd, room_id, username) = match *vec.as_slice() {
+    match *vec.as_slice() {
         [cmd, room_id, username] => {
             if cmd.to_uppercase() != "JOIN"
                 || is_oob(room_id)
@@ -99,68 +118,96 @@ async fn process_client(
                 || !room_id.is_ascii()
             {
                 tracing::warn!("{} failed cmd constraints: {} {} {}", addr, cmd, room_id, username);
-                return send_user_err(&mut line_stream).await;
             } else {
-                (cmd, room_id, username)
+                return Ok((cmd.to_string(),
+                           room_id.to_string(),
+                           username.to_string()))
             }
         }
         _ => {
             tracing::warn!("{} improperly formed cmd", addr);
-            return send_user_err(&mut line_stream).await;
         }
     };
-    // Register our Peer with state which internally sets up some channels
-    let (mut peer, sx) = Peer::new(line_stream);
-    // that way you just do 1 state.get_room_mut(room_id) lookup at the beginning
-    // and then lock the room instead of the whole state each time you access it
-    {
-        let mut state = state.write().await;
-        let room = state.get_room_mut(room_id);
-        room.add_peer(sx, &addr);
-        tracing::info!("+Room {}, User: {}", room_id, username);
-    }
-    // Alert all other Peers in the Room of new Peer
-    {
-        let state = state.read().await;
-        let room = state.get_room(room_id);
-        let msg = format!("{} has joined", username);
-        room.broadcast(msg.as_str()).await;
-    }
+    Err(std::io::Error::new(ErrorKind::InvalidInput, format!("Invalid command from {}", addr)))?
+}
+
+async fn create_peer(sx: Sx, peer_addr: &SocketAddr, state: &Arc<RwLock<SharedMemory>>, room_id: &str, username: &str)
+    -> Result<(), Box<dyn Error + Send + Sync + 'static>>
+{
+    let mut state = state.write().await;
+    let room = state.get_room_mut(room_id);
+    room.add_peer(sx, &peer_addr);
+    tracing::info!("+Room {}, User: {}", room_id, username);
+    Ok(())
+}
+
+async fn alert_peers(state: &Arc<RwLock<SharedMemory>>, room_id: &str, username: &str)
+    -> Result<(), Box<dyn Error + Send + Sync + 'static>>
+{
+    let state = state.read().await;
+    let room = match state.get_room(room_id) {
+        Some(room) => room,
+        _ => {
+            tracing::warn!("{} could not alert peers in Room {}", username, room_id);
+            return Ok(())
+        }
+    };
+    let msg = format!("{} has joined", username);
+    let _ = room.broadcast(msg.as_str()).await;
+    Ok(())
+}
+
+/// Messaging recv + send + Peer Disconnect loop
+async fn handle_messaging(peer: &mut Peer, state: &Arc<RwLock<SharedMemory>>, room_id: &str, username: &str)
+    -> Result<(), Box<dyn Error + Send + Sync + 'static>>
+{
     loop {
         tokio::select! {
+            // Peer received message
             Some(msg) = peer.rx.recv() => {
                 peer.reader.send(&msg).await?;
             }
+            // User wrote message
             result = peer.reader.next() => match result {
                 Some(Ok(msg)) => {
                     let msg = format!("{}: {}", username, msg);
                     tracing::info!("+Message: {}", msg);
                     let state = state.read().await;
-                    let room = state.get_room(room_id);
-                    room.broadcast(&msg).await;
+                    let room = match state.get_room(room_id) {
+                        Some(room) => room,
+                        _ => {
+                            tracing::warn!("{} could not message peers {} in Room", username, room_id);
+                            return Ok(())
+                        }
+                    };
+                    let _ = room.broadcast(&msg).await;
                 }
                 //
                 Some(Err(e)) => {
                     tracing::error!( "Error while processing messages for {}; {:?}", username, e);
                     // Disconnect peer to prevent potential DoS
-                    break;
+                    return Ok(())
                 }
                 // Peer disconnected
-                None => break,
+                None => {return Ok(());}
             },
         }
     }
-    {
-        // Exit Client
-        let mut state = state.write().await;
-        let room = state.get_room_mut(room_id);
-        room.rm_peer(&addr);
-        let msg = format!("{} has left", username);
-        tracing::info!("-Room {}, User: {}", room_id, username);
-        room.broadcast(msg.as_str()).await;
-        if room.is_empty() {
-            state.rooms.remove(room_id);
-        }
+}
+
+/// Clean up client
+async fn exit_client(peer_addr: &SocketAddr, state: &Arc<RwLock<SharedMemory>>, room_id: &str, username: &str)
+-> Result<(), Box<dyn Error + Send + Sync + 'static>>
+{
+    let mut state = state.write().await;
+    let room = state.get_room_mut(room_id);
+    room.rm_peer(&peer_addr);
+    let msg = format!("{} has left", username);
+    tracing::info!("-Room {}, User: {}", room_id, username);
+    let _ = room.broadcast(msg.as_str()).await;
+    if room.is_empty() {
+        state.rooms.remove(room_id);
+        tracing::info!("Room {} removed", room_id);
     }
     Ok(())
 }
@@ -193,14 +240,6 @@ fn is_oob(st: &str) -> bool {
     !(1..=20).contains(&st.len())
 }
 
-/// Return inputted Port or default Port
-fn get_port(default: u16) -> String {
-    env::args().nth(1).unwrap_or_else(|| {
-        println!("Using default port: {}", default);
-        default.to_string()
-    })
-}
-
 /// Send half of channel
 type Sx = mpsc::UnboundedSender<String>;
 /// Receive half of channel
@@ -221,9 +260,9 @@ impl SharedMemory {
         }
     }
 
-    fn get_room(&self, key: &str) -> &Room {
+    fn get_room(&self, key: &str) -> Option<&Room> {
         // expect ok here b/c key should statically be known to exist
-        self.rooms.get(key).expect("Room does not exist")
+        self.rooms.get(key)
     }
 
     fn get_room_mut(&mut self, key: &str) -> &mut Room {
@@ -271,9 +310,29 @@ impl Room {
     }
 
     /// Send a message ot each Peer in the Room
-    async fn broadcast(&self, message: &str) {
+    async fn broadcast(&self, message: &str)
+        -> Result<(), Box<dyn Error + Send + Sync + 'static>>
+    {
         self.peers.iter().map(|(_socket, sx)| sx).for_each(|sx| {
             let _ = sx.send(message.into());
         });
+        Ok(())
     }
+}
+
+fn setup_args() -> ArgMatches {
+    App::new("A Chat Server :)")
+        .version("1.0")
+        .author("ari i")
+        .about("Multi-user, multi-room chat server")
+        .arg(Arg::new("port")
+            .index(1)
+            .required(false)
+        )
+        .arg(Arg::new("is_pretty_printing")
+            .short('v')
+            .long("verbose")
+            .required(false)
+        )
+        .get_matches()
 }
