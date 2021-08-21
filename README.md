@@ -1,5 +1,6 @@
 ## Simple Multi-user, Multi-room Asynchronous Chat Server
-by ari i
+
+Built upon Tokio's [example](https://github.com/tokio-rs/tokio/blob/master/examples/chat.rs)
 
 + Uses Tokio for multi-threaded, concurrent async IO for massive scalability
 + Rooms hold Peers in a HalfBrown container for fast size-dependent lookup & 
